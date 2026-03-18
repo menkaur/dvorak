@@ -74,10 +74,26 @@ SIGNAL_SCRIPT="/usr/local/bin/dvorak-signal.sh"
 LAST_INDEX=""
 SUBSCRIBE_FIFO="/tmp/${SCRIPT_NAME}.$$.fifo"
 
+LOG_FILE="/tmp/dvorak-layout.log"
+MAX_LOG_BYTES=1048576  # 1 MiB
+
+# FIX: Rotate the log file so /tmp (often tmpfs) doesn't fill up.
+rotate_log() {
+    local size
+    size=$(stat -c%s "$LOG_FILE" 2>/dev/null) || return
+    if [[ "$size" -gt "$MAX_LOG_BYTES" ]]; then
+        mv -f "$LOG_FILE" "${LOG_FILE}.old"
+    fi
+}
+
+# FIX: Exclude the Virtual Dvorak Keyboard created by dvorak.c so we
+#      always read the layout index of a real physical keyboard.
 get_layout_index() {
     local result
     result=$(swaymsg -t get_inputs 2>/dev/null | jq -r '
-        [.[] | select(.type=="keyboard")] | .[0].xkb_active_layout_index // 0
+        [.[] | select(.type=="keyboard"
+                      and (.name | test("Virtual Dvorak"; "i") | not))]
+        | .[0].xkb_active_layout_index // 0
     ' 2>/dev/null)
     if [[ "$result" =~ ^[0-9]+$ ]]; then
         echo "$result"
@@ -86,16 +102,26 @@ get_layout_index() {
     fi
 }
 
+# FIX: Only update LAST_INDEX when the signal script succeeds.
+#      On failure, clear LAST_INDEX so the next event retries
+#      instead of being silently suppressed.
+# FIX: Capture $? before $(date ...) clobbers it.
 signal_for_index() {
     local index="$1"
     [[ -z "$index" ]] && return
     [[ "$index" == "$LAST_INDEX" ]] && return
-    LAST_INDEX="$index"
 
-    if [[ "$index" -eq 0 ]]; then
-        "$SIGNAL_SCRIPT" on  >>/tmp/dvorak-layout.log 2>&1
+    local cmd
+    if [[ "$index" -eq 0 ]]; then cmd="on"; else cmd="off"; fi
+
+    rotate_log
+
+    if "$SIGNAL_SCRIPT" "$cmd" >>"$LOG_FILE" 2>&1; then
+        LAST_INDEX="$index"
     else
-        "$SIGNAL_SCRIPT" off >>/tmp/dvorak-layout.log 2>&1
+        local rc=$?
+        echo "$(date '+%F %T') signal_for_index: dvorak-signal.sh $cmd failed (exit $rc), will retry" >>"$LOG_FILE" 2>&1
+        LAST_INDEX=""
     fi
 }
 

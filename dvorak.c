@@ -252,6 +252,10 @@ static bool keys_pressed_test(int code) {
   return false;
 }
 
+// FIX: Retry write() on EINTR.  Without SA_RESTART on SIGUSR1/SIGUSR2,
+// a signal can interrupt write() mid-call.  If we don't retry, the key
+// event is silently dropped, which can cause stuck keys (e.g. key-down
+// emitted but key-up lost).
 static bool emit(int fd, int type, int code, int value, struct timeval time) {
   struct input_event ev = {0};
   ev.type = type;
@@ -267,7 +271,11 @@ static bool emit(int fd, int type, int code, int value, struct timeval time) {
     }
   }
 
-  ssize_t n = write(fd, &ev, sizeof(ev));
+  ssize_t n;
+  do {
+    n = write(fd, &ev, sizeof(ev));
+  } while (n < 0 && errno == EINTR);
+
   if (n == (ssize_t)sizeof(ev))
     return true;
   if (n < 0) {
@@ -420,16 +428,31 @@ int main(int argc, char *argv[]) {
   sigaction(SIGTERM, &sa_term, NULL);
   sigaction(SIGINT, &sa_term, NULL);
 
+  // FIX: Do NOT use SA_RESTART for SIGUSR1/SIGUSR2.
+  // Without SA_RESTART, a signal during read() causes it to return -1
+  // with errno==EINTR.  The event loop handles EINTR with "continue",
+  // which jumps back to the top of the loop where pending_mode is now
+  // checked BEFORE read() — so mode changes take effect instantly
+  // instead of being deferred until the next physical keypress.
+  //
+  // Cross-mask the two signals so USR1 and USR2 cannot interrupt
+  // each other's handler (defensive; writes to sig_atomic_t are
+  // already atomic).
+  //
+  // NOTE: This means write() in emit() can also get EINTR — that is
+  // handled with a retry loop there.
   struct sigaction sa_usr1 = {0};
   sa_usr1.sa_handler = sigusr1_handler;
   sigemptyset(&sa_usr1.sa_mask);
-  sa_usr1.sa_flags = SA_RESTART;
+  sigaddset(&sa_usr1.sa_mask, SIGUSR2);
+  sa_usr1.sa_flags = 0;
   sigaction(SIGUSR1, &sa_usr1, NULL);
 
   struct sigaction sa_usr2 = {0};
   sa_usr2.sa_handler = sigusr2_handler;
   sigemptyset(&sa_usr2.sa_mask);
-  sa_usr2.sa_flags = SA_RESTART;
+  sigaddset(&sa_usr2.sa_mask, SIGUSR1);
+  sa_usr2.sa_flags = 0;
   sigaction(SIGUSR2, &sa_usr2, NULL);
 
   signal(SIGPIPE, SIG_IGN);
@@ -691,6 +714,26 @@ int main(int argc, char *argv[]) {
           getpid());
 
   while (keep_running) {
+    // FIX: Process pending signal-driven mode change BEFORE read().
+    // When a signal interrupts read() (returning EINTR), "continue"
+    // brings us here immediately, so the mode change is applied
+    // before we block on read() again.
+    if (pending_mode != MODE_NO_CHANGE && mod_state == 0 &&
+        array_qwerty_counter == 0) {
+      if (pending_mode == MODE_ON) {
+        disable_mapping = false;
+        signal_controlled = true;
+        l_alt = 0;
+        fprintf(stderr, "Signal: Dvorak mapping enabled (on)\n");
+      } else if (pending_mode == MODE_OFF) {
+        disable_mapping = true;
+        signal_controlled = true;
+        l_alt = 0;
+        fprintf(stderr, "Signal: passthrough mode (off)\n");
+      }
+      pending_mode = MODE_NO_CHANGE;
+    }
+
     ssize_t n = read(fdi, &ev, sizeof ev);
     if (n == (ssize_t)-1) {
       if (errno == EINTR)
@@ -707,23 +750,6 @@ int main(int argc, char *argv[]) {
       fprintf(stderr, "short read on [%s]: %zd bytes\n", device, n);
       exit_code = EXIT_DEVICE_GONE;
       break;
-    }
-
-    // Deferred mode switch: only apply when no shortcut is active.
-    if (pending_mode != MODE_NO_CHANGE && mod_state == 0 &&
-        array_qwerty_counter == 0) {
-      if (pending_mode == MODE_ON) {
-        disable_mapping = false;
-        signal_controlled = true;
-        l_alt = 0;
-        fprintf(stderr, "Signal: Dvorak mapping enabled (on)\n");
-      } else if (pending_mode == MODE_OFF) {
-        disable_mapping = true;
-        signal_controlled = true;
-        l_alt = 0;
-        fprintf(stderr, "Signal: passthrough mode (off)\n");
-      }
-      pending_mode = MODE_NO_CHANGE;
     }
 
     // Left-alt toggle: suppressed when under signal control.

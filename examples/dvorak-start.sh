@@ -2,13 +2,35 @@
 set -uo pipefail
 shopt -s nullglob
 
+# dvorak-start.sh — Find the correct /dev/input device for a named
+# keyboard and launch the dvorak binary on it.
+#
+# Dvorak is started in daemon mode (-D) by default, suppressing all
+# console output from the event loop to prevent I/O from blocking
+# the hot path.  Pass --verbose to re-enable output for debugging.
+#
+# Usage:  dvorak-start.sh [--verbose] "Keyboard Name"
+
 PIDFILE_DIR="/run"
-MATCH_NAME="${1:-}"
 CHILD_PID=""
+
+# Default: daemon mode (suppress dvorak output)
+DVORAK_FLAGS="-D"
+
+# Parse arguments — separate --verbose from the keyboard name
+args=()
+for arg in "$@"; do
+    case "$arg" in
+        --verbose) DVORAK_FLAGS="" ;;
+        *)         args+=("$arg") ;;
+    esac
+done
+
+MATCH_NAME="${args[0]:-}"
 
 if [[ -z "$MATCH_NAME" ]]; then
     echo "ERROR: No keyboard name provided." >&2
-    echo "Usage: $0 \"Keyboard Name\"" >&2
+    echo "Usage: $0 [--verbose] \"Keyboard Name\"" >&2
     exit 1
 fi
 
@@ -100,7 +122,8 @@ for DEV in "${DEVICES[@]}"; do
 
     echo "Trying dvorak on $DEV (pidfile: $PIDFILE)"
 
-    /usr/local/bin/dvorak -d "$DEV" -p "$PIDFILE" &
+    # shellcheck disable=SC2086  # intentional: DVORAK_FLAGS may be empty
+    /usr/local/bin/dvorak $DVORAK_FLAGS -d "$DEV" -p "$PIDFILE" &
     CHILD_PID=$!
     wait "$CHILD_PID" 2>/dev/null
     EXIT_CODE=$?
@@ -108,12 +131,10 @@ for DEV in "${DEVICES[@]}"; do
     rm -f "$PIDFILE"
 
     if [[ $EXIT_CODE -eq 0 ]]; then
-        # Exit 0 = "not a keyboard" or clean stop from signal.
         echo "$DEV exited 0 (not a keyboard or clean stop), trying next..."
         continue
     fi
 
-    # Non-zero: this was the real keyboard. Exit so systemd can restart us.
     echo "dvorak on $DEV exited with code $EXIT_CODE"
     exit "$EXIT_CODE"
 done

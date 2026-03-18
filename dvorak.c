@@ -90,8 +90,10 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <linux/uinput.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -117,6 +119,23 @@ static char *pidfile_path = NULL;
 
 // Bitmap tracking every key currently held on the virtual output device.
 static unsigned char keys_pressed[KEY_COUNT / 8 + 1];
+
+/* ── Single global flag controlling all output ───────────────────── */
+static bool quiet_mode = false;
+
+/* All output (except usage()) goes through this function.
+ * Set quiet_mode = true (--daemon / -D) to suppress everything,
+ * eliminating any I/O that could stall the event loop.             */
+__attribute__((format(printf, 2, 3))) static void
+log_msg(FILE *stream, const char *fmt, ...) {
+  if (quiet_mode)
+    return;
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(stream, fmt, ap);
+  va_end(ap);
+}
+/* ─────────────────────────────────────────────────────────────────── */
 
 static void cleanup_pidfile(void) {
   if (pidfile_path != NULL) {
@@ -252,10 +271,10 @@ static bool keys_pressed_test(int code) {
   return false;
 }
 
-// FIX: Retry write() on EINTR.  Without SA_RESTART on SIGUSR1/SIGUSR2,
-// a signal can interrupt write() mid-call.  If we don't retry, the key
-// event is silently dropped, which can cause stuck keys (e.g. key-down
-// emitted but key-up lost).
+// FIX: EINTR retry loop around write().  Without SA_RESTART on
+// SIGUSR1/SIGUSR2, a signal can interrupt write() mid-call.
+// Without the retry, the key event is silently dropped, which
+// can cause stuck keys.
 static bool emit(int fd, int type, int code, int value, struct timeval time) {
   struct input_event ev = {0};
   ev.type = type;
@@ -279,9 +298,9 @@ static bool emit(int fd, int type, int code, int value, struct timeval time) {
   if (n == (ssize_t)sizeof(ev))
     return true;
   if (n < 0) {
-    fprintf(stderr, "emit write failed: %s\n", strerror(errno));
+    log_msg(stderr, "emit write failed: %s\n", strerror(errno));
   } else {
-    fprintf(stderr, "emit short write: %zd/%zu\n", n, sizeof(ev));
+    log_msg(stderr, "emit short write: %zd/%zu\n", n, sizeof(ev));
   }
   return false;
 }
@@ -323,19 +342,19 @@ static bool setup_event_type(int fdi, int fdo, unsigned long event_type,
     switch (event_type) {
     case UI_SET_EVBIT:
       if (ioctl(fdo, UI_SET_EVBIT, i) < 0) {
-        fprintf(stderr, "Cannot set EV bit %d: %s\n", i, strerror(errno));
+        log_msg(stderr, "Cannot set EV bit %d: %s\n", i, strerror(errno));
         return false;
       }
       break;
     case UI_SET_KEYBIT:
       if (ioctl(fdo, UI_SET_KEYBIT, i) < 0) {
-        fprintf(stderr, "Cannot set KEY bit %d: %s\n", i, strerror(errno));
+        log_msg(stderr, "Cannot set KEY bit %d: %s\n", i, strerror(errno));
         return false;
       }
       break;
     case UI_SET_RELBIT:
       if (ioctl(fdo, UI_SET_RELBIT, i) < 0) {
-        fprintf(stderr, "Cannot set REL bit %d: %s\n", i, strerror(errno));
+        log_msg(stderr, "Cannot set REL bit %d: %s\n", i, strerror(errno));
         return false;
       }
       break;
@@ -343,24 +362,24 @@ static bool setup_event_type(int fdi, int fdo, unsigned long event_type,
       struct uinput_abs_setup abs_setup = {0};
       abs_setup.code = i;
       if (ioctl(fdi, EVIOCGABS(i), &abs_setup.absinfo) < 0) {
-        fprintf(stderr, "Failed to get ABS info for axis %d: %s\n", i,
+        log_msg(stderr, "Failed to get ABS info for axis %d: %s\n", i,
                 strerror(errno));
         continue;
       }
       if (ioctl(fdo, UI_ABS_SETUP, &abs_setup) < 0) {
-        fprintf(stderr, "Failed to setup ABS axis %d: %s\n", i,
+        log_msg(stderr, "Failed to setup ABS axis %d: %s\n", i,
                 strerror(errno));
         continue;
       }
       if (ioctl(fdo, UI_SET_ABSBIT, i) < 0) {
-        fprintf(stderr, "Cannot set ABS bit %d: %s\n", i, strerror(errno));
+        log_msg(stderr, "Cannot set ABS bit %d: %s\n", i, strerror(errno));
         return false;
       }
       break;
     }
     case UI_SET_MSCBIT:
       if (ioctl(fdo, UI_SET_MSCBIT, i) < 0) {
-        fprintf(stderr, "Cannot set MSC bit %d: %s\n", i, strerror(errno));
+        log_msg(stderr, "Cannot set MSC bit %d: %s\n", i, strerror(errno));
         return false;
       }
       break;
@@ -369,6 +388,8 @@ static bool setup_event_type(int fdi, int fdo, unsigned long event_type,
   return true;
 }
 
+// usage() always prints directly — it runs on bad args, before
+// daemon mode matters, and the user needs to see the help text.
 static void usage(const char *path) {
   const char *basename = strrchr(path, '/');
   basename = basename ? basename + 1 : path;
@@ -387,7 +408,9 @@ static void usage(const char *path) {
   fprintf(stderr, "  -c\t\t\t"
                   "Disable caps lock as a modifier.\n");
   fprintf(stderr, "  -p FILE\t\t"
-                  "Write PID to FILE (useful for daemon mode).\n\n");
+                  "Write PID to FILE (useful for daemon mode).\n");
+  fprintf(stderr, "  -D, --daemon\t\t"
+                  "Suppress all output (for daemon/service use).\n\n");
   fprintf(stderr, "Signals:\n");
   fprintf(stderr, "  SIGUSR1\t\t"
                   "Enable Dvorak mapping (on).\n");
@@ -403,11 +426,11 @@ static void usage(const char *path) {
 static bool write_pidfile(const char *path) {
   FILE *f = fopen(path, "w");
   if (f == NULL) {
-    fprintf(stderr, "Error: Cannot write PID file [%s]: %s\n", path,
+    log_msg(stderr, "Error: Cannot write PID file [%s]: %s\n", path,
             strerror(errno));
     return false;
   }
-  fprintf(f, "%d\n", getpid());
+  fprintf(f, "%d\n", getpid()); // writing to PID file, not logging
   fclose(f);
   return true;
 }
@@ -428,19 +451,9 @@ int main(int argc, char *argv[]) {
   sigaction(SIGTERM, &sa_term, NULL);
   sigaction(SIGINT, &sa_term, NULL);
 
-  // FIX: Do NOT use SA_RESTART for SIGUSR1/SIGUSR2.
-  // Without SA_RESTART, a signal during read() causes it to return -1
-  // with errno==EINTR.  The event loop handles EINTR with "continue",
-  // which jumps back to the top of the loop where pending_mode is now
-  // checked BEFORE read() — so mode changes take effect instantly
-  // instead of being deferred until the next physical keypress.
-  //
-  // Cross-mask the two signals so USR1 and USR2 cannot interrupt
-  // each other's handler (defensive; writes to sig_atomic_t are
-  // already atomic).
-  //
-  // NOTE: This means write() in emit() can also get EINTR — that is
-  // handled with a retry loop there.
+  // FIX: No SA_RESTART — read() returns EINTR on signal so the event
+  // loop's "continue" brings us to the pending_mode check immediately.
+  // Cross-mask USR1 ↔ USR2 so they cannot interrupt each other's handler.
   struct sigaction sa_usr1 = {0};
   sa_usr1.sa_handler = sigusr1_handler;
   sigemptyset(&sa_usr1.sa_mask);
@@ -457,10 +470,14 @@ int main(int argc, char *argv[]) {
 
   signal(SIGPIPE, SIG_IGN);
 
+  static const struct option long_options[] = {
+      {"daemon", no_argument, NULL, 'D'}, {NULL, 0, NULL, 0}};
+
   int opt;
   char *device = NULL, *match = NULL;
   bool noToggle = false, noCapsLockAsModifier = false;
-  while ((opt = getopt(argc, argv, "d:m:p:tc")) != -1) {
+  while ((opt = getopt_long(argc, argv, "d:m:p:tcD", long_options, NULL)) !=
+         -1) {
     switch (opt) {
     case 'd':
       device = optarg;
@@ -476,6 +493,9 @@ int main(int argc, char *argv[]) {
       break;
     case 'c':
       noCapsLockAsModifier = true;
+      break;
+    case 'D':
+      quiet_mode = true;
       break;
     default:
       usage(argv[0]);
@@ -499,7 +519,7 @@ int main(int argc, char *argv[]) {
 
   int fdi = open(device, O_RDONLY);
   if (fdi < 0) {
-    fprintf(stderr, "Error: Failed to open device [%s]: %s.\n", device,
+    log_msg(stderr, "Error: Failed to open device [%s]: %s.\n", device,
             strerror(errno));
     return (errno == ENOENT || errno == ENODEV) ? EXIT_DEVICE_GONE
                                                 : EXIT_FAILURE;
@@ -509,7 +529,7 @@ int main(int argc, char *argv[]) {
   int ret_val =
       ioctl(fdi, EVIOCGNAME(sizeof(keyboard_name) - 1), keyboard_name);
   if (ret_val < 0) {
-    fprintf(stderr, "Error: Unable to retrieve device name for [%s]: %s.\n",
+    log_msg(stderr, "Error: Unable to retrieve device name for [%s]: %s.\n",
             device, strerror(errno));
     close(fdi);
     return EXIT_FAILURE;
@@ -523,7 +543,7 @@ int main(int argc, char *argv[]) {
   memcpy(usetup.name, virtual_name, sizeof(virtual_name));
 
   if (strcmp(keyboard_name, virtual_name) == 0) {
-    fprintf(stdout,
+    log_msg(stdout,
             "Info: Skipping mapping for the device we just created: %s.\n",
             keyboard_name);
     close(fdi);
@@ -533,7 +553,7 @@ int main(int argc, char *argv[]) {
   if (match != NULL) {
     char *match_copy = strdup(match);
     if (match_copy == NULL) {
-      fprintf(stderr, "Error: strdup failed\n");
+      log_msg(stderr, "Error: strdup failed\n");
       close(fdi);
       return EXIT_FAILURE;
     }
@@ -541,8 +561,8 @@ int main(int argc, char *argv[]) {
     char *token = strtok(match_copy, " ");
     while (token != NULL) {
       if (strcasestr(keyboard_name, token) != NULL) {
-        printf("Info: Found matching input: [%s] for device [%s].\n",
-               keyboard_name, device);
+        log_msg(stdout, "Info: Found matching input: [%s] for device [%s].\n",
+                keyboard_name, device);
         found = true;
         break;
       }
@@ -550,7 +570,7 @@ int main(int argc, char *argv[]) {
     }
     free(match_copy);
     if (!found) {
-      fprintf(stderr,
+      log_msg(stderr,
               "Error: Device [%s] does not match any specified "
               "keywords.\n",
               keyboard_name);
@@ -568,7 +588,7 @@ int main(int argc, char *argv[]) {
 
   ret_val = ioctl(fdi, EVIOCGBIT(0, sizeof(array_bit_ev)), &array_bit_ev);
   if (ret_val < 0) {
-    fprintf(stderr,
+    log_msg(stderr,
             "Error: Failed to retrieve event capabilities for [%s]: %s.\n",
             device, strerror(errno));
     close(fdi);
@@ -579,7 +599,7 @@ int main(int argc, char *argv[]) {
     ret_val =
         ioctl(fdi, EVIOCGBIT(EV_KEY, sizeof(array_bit_key)), &array_bit_key);
     if (ret_val < 0) {
-      fprintf(stderr, "Error: Failed to retrieve EV_KEY capabilities: %s.\n",
+      log_msg(stderr, "Error: Failed to retrieve EV_KEY capabilities: %s.\n",
               strerror(errno));
       close(fdi);
       return EXIT_FAILURE;
@@ -590,7 +610,7 @@ int main(int argc, char *argv[]) {
     ret_val =
         ioctl(fdi, EVIOCGBIT(EV_REL, sizeof(array_bit_rel)), &array_bit_rel);
     if (ret_val < 0) {
-      fprintf(stderr, "Error: Failed to retrieve EV_REL capabilities: %s.\n",
+      log_msg(stderr, "Error: Failed to retrieve EV_REL capabilities: %s.\n",
               strerror(errno));
       close(fdi);
       return EXIT_FAILURE;
@@ -601,7 +621,7 @@ int main(int argc, char *argv[]) {
     ret_val =
         ioctl(fdi, EVIOCGBIT(EV_ABS, sizeof(array_bit_abs)), &array_bit_abs);
     if (ret_val < 0) {
-      fprintf(stderr, "Error: Failed to retrieve EV_ABS capabilities: %s.\n",
+      log_msg(stderr, "Error: Failed to retrieve EV_ABS capabilities: %s.\n",
               strerror(errno));
       close(fdi);
       return EXIT_FAILURE;
@@ -612,18 +632,26 @@ int main(int argc, char *argv[]) {
     ret_val =
         ioctl(fdi, EVIOCGBIT(EV_MSC, sizeof(array_bit_msc)), &array_bit_msc);
     if (ret_val < 0) {
-      fprintf(stderr, "Error: Failed to retrieve EV_MSC capabilities: %s.\n",
+      log_msg(stderr, "Error: Failed to retrieve EV_MSC capabilities: %s.\n",
               strerror(errno));
       close(fdi);
       return EXIT_FAILURE;
     }
   }
 
+  // FIX: Clear EV_REP from the capabilities we copy to the virtual device.
+  // The physical keyboard has EV_REP, which tells the kernel to run its
+  // own auto-repeat timer generating value=2 events.  Since we already
+  // *forward* value=2 events from the physical keyboard, enabling EV_REP
+  // on the virtual device creates a second, independent stream of repeats
+  // — doubling every held key.  Clearing the bit prevents this.
+  array_bit_ev[EV_REP / 32] &= ~(1U << (EV_REP % 32));
+
   // Check we are a keyboard — exit 0 (not a keyboard) so wrapper tries next
   if (!(array_bit_key[KEY_X / 32] & (1U << (KEY_X % 32))) ||
       !(array_bit_key[KEY_C / 32] & (1U << (KEY_C % 32))) ||
       !(array_bit_key[KEY_V / 32] & (1U << (KEY_V % 32)))) {
-    fprintf(stdout, "Info: Device [%s] is not recognized as a keyboard.\n",
+    log_msg(stdout, "Info: Device [%s] is not recognized as a keyboard.\n",
             device);
     close(fdi);
     return EXIT_SUCCESS;
@@ -631,14 +659,14 @@ int main(int argc, char *argv[]) {
 
   int fdo = open("/dev/uinput", O_WRONLY);
   if (fdo < 0) {
-    fprintf(stderr, "Error: Failed to open /dev/uinput: %s.\n",
+    log_msg(stderr, "Error: Failed to open /dev/uinput: %s.\n",
             strerror(errno));
     close(fdi);
     return EXIT_FAILURE;
   }
 
   if (ioctl(fdo, UI_DEV_SETUP, &usetup) < 0) {
-    fprintf(stderr, "Error: Failed to configure virtual device: %s.\n",
+    log_msg(stderr, "Error: Failed to configure virtual device: %s.\n",
             strerror(errno));
     close(fdo);
     close(fdi);
@@ -650,7 +678,7 @@ int main(int argc, char *argv[]) {
       !setup_event_type(fdi, fdo, UI_SET_RELBIT, REL_MAX + 1, array_bit_rel) ||
       !setup_event_type(fdi, fdo, UI_SET_ABSBIT, ABS_MAX + 1, array_bit_abs) ||
       !setup_event_type(fdi, fdo, UI_SET_MSCBIT, MSC_MAX + 1, array_bit_msc)) {
-    fprintf(stderr, "Cannot setup event types for device [%s]: %s.\n", device,
+    log_msg(stderr, "Cannot setup event types for device [%s]: %s.\n", device,
             strerror(errno));
     close(fdo);
     close(fdi);
@@ -658,7 +686,7 @@ int main(int argc, char *argv[]) {
   }
 
   if (ioctl(fdo, UI_DEV_CREATE) < 0) {
-    fprintf(stderr, "Cannot create device: %s.\n", strerror(errno));
+    log_msg(stderr, "Cannot create device: %s.\n", strerror(errno));
     close(fdo);
     close(fdi);
     return EXIT_FAILURE;
@@ -673,7 +701,7 @@ int main(int argc, char *argv[]) {
     for (int attempt = 0; attempt < 50; attempt++) {
       memset(key_state, 0, sizeof(key_state));
       if (ioctl(fdi, EVIOCGKEY(sizeof(key_state)), key_state) < 0) {
-        fprintf(stderr, "Device gone during key-wait: %s\n", strerror(errno));
+        log_msg(stderr, "Device gone during key-wait: %s\n", strerror(errno));
         ioctl(fdo, UI_DEV_DESTROY);
         close(fdo);
         close(fdi);
@@ -693,7 +721,7 @@ int main(int argc, char *argv[]) {
   }
 
   if (ioctl(fdi, EVIOCGRAB, 1) < 0) {
-    fprintf(stderr, "Cannot grab device: %s.\n", strerror(errno));
+    log_msg(stderr, "Cannot grab device: %s.\n", strerror(errno));
     ioctl(fdo, UI_DEV_DESTROY);
     close(fdo);
     close(fdi);
@@ -707,29 +735,28 @@ int main(int argc, char *argv[]) {
   unsigned int array_qwerty[MAX_LENGTH] = {0};
   int exit_code = EXIT_SUCCESS;
 
-  fprintf(stderr, "Starting event loop with keyboard: [%s] for device [%s].\n",
+  log_msg(stderr, "Starting event loop with keyboard: [%s] for device [%s].\n",
           keyboard_name, device);
-  fprintf(stderr,
+  log_msg(stderr,
           "PID: %d (send SIGUSR1 to enable mapping, SIGUSR2 to passthrough)\n",
           getpid());
 
   while (keep_running) {
-    // FIX: Process pending signal-driven mode change BEFORE read().
-    // When a signal interrupts read() (returning EINTR), "continue"
-    // brings us here immediately, so the mode change is applied
-    // before we block on read() again.
+    // FIX: Process pending mode change BEFORE read().
+    // Signal → read() returns EINTR → continue → here → mode applied
+    // → read() blocks cleanly in the new mode.
     if (pending_mode != MODE_NO_CHANGE && mod_state == 0 &&
         array_qwerty_counter == 0) {
       if (pending_mode == MODE_ON) {
         disable_mapping = false;
         signal_controlled = true;
         l_alt = 0;
-        fprintf(stderr, "Signal: Dvorak mapping enabled (on)\n");
+        log_msg(stderr, "Signal: Dvorak mapping enabled (on)\n");
       } else if (pending_mode == MODE_OFF) {
         disable_mapping = true;
         signal_controlled = true;
         l_alt = 0;
-        fprintf(stderr, "Signal: passthrough mode (off)\n");
+        log_msg(stderr, "Signal: passthrough mode (off)\n");
       }
       pending_mode = MODE_NO_CHANGE;
     }
@@ -738,29 +765,27 @@ int main(int argc, char *argv[]) {
     if (n == (ssize_t)-1) {
       if (errno == EINTR)
         continue;
-      fprintf(stderr, "read error on [%s]: %s (errno=%d)\n", device,
+      log_msg(stderr, "read error on [%s]: %s (errno=%d)\n", device,
               strerror(errno), errno);
       exit_code = EXIT_DEVICE_GONE;
       break;
     } else if (n == 0) {
-      fprintf(stderr, "EOF on [%s] — device disconnected\n", device);
+      log_msg(stderr, "EOF on [%s] — device disconnected\n", device);
       exit_code = EXIT_DEVICE_GONE;
       break;
     } else if (n != sizeof ev) {
-      fprintf(stderr, "short read on [%s]: %zd bytes\n", device, n);
+      log_msg(stderr, "short read on [%s]: %zd bytes\n", device, n);
       exit_code = EXIT_DEVICE_GONE;
       break;
     }
 
     // Left-alt toggle: suppressed when under signal control.
-    // Guard on EV_KEY so non-key events with coincidental .code don't
-    // trigger.
     if (!signal_controlled && !noToggle && ev.type == EV_KEY &&
         ev.code == KEY_LEFTALT) {
       if (ev.value == 1 && ++l_alt >= 3) {
         disable_mapping = !disable_mapping;
         l_alt = 0;
-        fprintf(stdout, "mapping is set to [%s]\n",
+        log_msg(stdout, "mapping is set to [%s]\n",
                 !disable_mapping ? "true" : "false");
       }
     } else if (ev.type == EV_KEY) {
@@ -787,7 +812,7 @@ int main(int argc, char *argv[]) {
         if (ev.value == 1) {
           if (mod_state > 0) {
             if (array_qwerty_counter == MAX_LENGTH) {
-              fprintf(stderr,
+              log_msg(stderr,
                       "warning, too many keys pressed: %d. 0x%04x "
                       "(%d), arr:%d\n",
                       MAX_LENGTH, (int)ev.code, (int)ev.code,
@@ -845,7 +870,7 @@ int main(int argc, char *argv[]) {
   }
 
   // Clean shutdown
-  fprintf(stderr, "Shutting down: releasing grab and cleaning up.\n");
+  log_msg(stderr, "Shutting down: releasing grab and cleaning up.\n");
   ioctl(fdi, EVIOCGRAB, 0);
   shutdown_virtual_device(fdo);
   close(fdi);

@@ -3,9 +3,20 @@
 # Listens for Sway input events and signals dvorak daemons
 # whenever the keyboard layout changes.
 #
+# Usage:  sway_layout-watcher.sh [--daemon]
+#
 # Layout indexes (must match your sway input config):
 #   0 = dvorak  → dvorak-signal.sh on
 #   1/2/3       → dvorak-signal.sh off
+
+# ── Single global flag controlling all output ────────────────────────
+QUIET=false
+for _arg in "$@"; do
+    [[ "$_arg" == "--daemon" ]] && QUIET=true
+done
+
+log() { "$QUIET" && return 0; printf '%s\n' "$*" >&2; }
+# ─────────────────────────────────────────────────────────────────────
 
 # ── Kill the previous instance (if any) ─────────────────────────────
 SCRIPT_NAME="$(basename "$0")"
@@ -77,7 +88,7 @@ SUBSCRIBE_FIFO="/tmp/${SCRIPT_NAME}.$$.fifo"
 LOG_FILE="/tmp/dvorak-layout.log"
 MAX_LOG_BYTES=1048576  # 1 MiB
 
-# FIX: Rotate the log file so /tmp (often tmpfs) doesn't fill up.
+# FIX: Rotate log so /tmp (often tmpfs) doesn't fill up.
 rotate_log() {
     local size
     size=$(stat -c%s "$LOG_FILE" 2>/dev/null) || return
@@ -102,10 +113,12 @@ get_layout_index() {
     fi
 }
 
-# FIX: Only update LAST_INDEX when the signal script succeeds.
-#      On failure, clear LAST_INDEX so the next event retries
-#      instead of being silently suppressed.
-# FIX: Capture $? before $(date ...) clobbers it.
+# FIX: Only update LAST_INDEX on success. Clear on failure to force retry.
+# FIX: Capture $? before $(date) clobbers it.
+# FIX (this round): Do NOT pass --quiet to signal script — just redirect
+#      output to /dev/null.  This keeps the watcher compatible with any
+#      version of dvorak-signal.sh, and the redirect already suppresses
+#      all output.
 signal_for_index() {
     local index="$1"
     [[ -z "$index" ]] && return
@@ -114,13 +127,20 @@ signal_for_index() {
     local cmd
     if [[ "$index" -eq 0 ]]; then cmd="on"; else cmd="off"; fi
 
-    rotate_log
+    local log_target="$LOG_FILE"
+    if "$QUIET"; then
+        log_target="/dev/null"
+    else
+        rotate_log
+    fi
 
-    if "$SIGNAL_SCRIPT" "$cmd" >>"$LOG_FILE" 2>&1; then
+    if "$SIGNAL_SCRIPT" "$cmd" >>"$log_target" 2>&1; then
         LAST_INDEX="$index"
     else
         local rc=$?
-        echo "$(date '+%F %T') signal_for_index: dvorak-signal.sh $cmd failed (exit $rc), will retry" >>"$LOG_FILE" 2>&1
+        if ! "$QUIET"; then
+            echo "$(date '+%F %T') signal_for_index: dvorak-signal.sh $cmd failed (exit $rc), will retry" >>"$LOG_FILE" 2>&1
+        fi
         LAST_INDEX=""
     fi
 }

@@ -92,6 +92,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <linux/uinput.h>
+#include <poll.h> // CHANGE: needed for poll() — bounded wait when deadline active
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -99,6 +100,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include <time.h> // CHANGE: needed for clock_gettime / struct timespec
 #include <unistd.h>
 
 #define MAX_LENGTH 8
@@ -111,6 +113,12 @@
 #define MODE_NO_CHANGE 0
 #define MODE_ON 1
 #define MODE_OFF 2
+
+// CHANGE: Maximum seconds to wait for modifiers/keys to release before
+// force-applying a deferred mode change.  Prevents indefinite deferral
+// when mod_state or array_qwerty_counter gets stuck non-zero (e.g. from
+// duplicate key-press events or a dropped release event).
+#define PENDING_MODE_TIMEOUT_SEC 1
 
 static volatile sig_atomic_t keep_running = 1;
 static volatile sig_atomic_t pending_mode = MODE_NO_CHANGE;
@@ -326,6 +334,33 @@ static void release_all_keys(int fdo) {
   (void)write(fdo, &syn, sizeof(syn));
 
   memset(keys_pressed, 0, sizeof(keys_pressed));
+}
+
+// CHANGE: Rebuild mod_state from actual hardware key state.
+// Called after every mode transition so that mod_state is accurate
+// even if modifiers were pressed/released while in passthrough mode
+// (where mod_state is not tracked by the event-processing logic).
+// Uses EVIOCGKEY to read the physical device's key bitmap directly.
+static void sync_mod_state_from_hardware(int fdi, int *mod_state_out,
+                                         bool noCapsLockAsModifier) {
+  unsigned char hw_keys[KEY_COUNT / 8 + 1];
+  memset(hw_keys, 0, sizeof(hw_keys));
+  if (ioctl(fdi, EVIOCGKEY(sizeof(hw_keys)), hw_keys) < 0)
+    return; // best-effort: leave mod_state as-is on failure
+
+  int new_mod = 0;
+  static const int mod_keys[] = {KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTALT,
+                                 KEY_LEFTMETA, KEY_CAPSLOCK};
+  for (size_t i = 0; i < sizeof(mod_keys) / sizeof(mod_keys[0]); i++) {
+    int k = mod_keys[i];
+    if (hw_keys[k / 8] & (1U << (k % 8))) {
+      int bit = modifier_bit(k);
+      if (noCapsLockAsModifier && bit == modifier_bit(KEY_CAPSLOCK))
+        continue;
+      new_mod |= bit;
+    }
+  }
+  *mod_state_out = new_mod;
 }
 
 static bool has_event_type(const unsigned int array_bit_ev[], int event_type) {
@@ -735,6 +770,10 @@ int main(int argc, char *argv[]) {
   unsigned int array_qwerty[MAX_LENGTH] = {0};
   int exit_code = EXIT_SUCCESS;
 
+  // CHANGE: Deadline tracking for deferred mode changes.
+  bool pending_mode_has_deadline = false;
+  struct timespec pending_mode_deadline = {0};
+
   log_msg(stderr, "Starting event loop with keyboard: [%s] for device [%s].\n",
           keyboard_name, device);
   log_msg(stderr,
@@ -742,24 +781,111 @@ int main(int argc, char *argv[]) {
           getpid());
 
   while (keep_running) {
-    // FIX: Process pending mode change BEFORE read().
-    // Signal → read() returns EINTR → continue → here → mode applied
-    // → read() blocks cleanly in the new mode.
-    if (pending_mode != MODE_NO_CHANGE && mod_state == 0 &&
-        array_qwerty_counter == 0) {
-      if (pending_mode == MODE_ON) {
-        disable_mapping = false;
-        signal_controlled = true;
-        l_alt = 0;
-        log_msg(stderr, "Signal: Dvorak mapping enabled (on)\n");
-      } else if (pending_mode == MODE_OFF) {
-        disable_mapping = true;
-        signal_controlled = true;
-        l_alt = 0;
-        log_msg(stderr, "Signal: passthrough mode (off)\n");
+    // ── CHANGE: Process pending mode change BEFORE read() ────────────
+    // Signal → read()/poll() returns EINTR → continue → here.
+    //
+    // Three paths:
+    //   1. No keys/modifiers held       → apply immediately.
+    //   2. Keys held, no deadline yet    → set deadline, keep deferring.
+    //   3. Keys held, deadline expired   → force release + apply.
+    //
+    // After every mode application we sync mod_state from hardware
+    // (EVIOCGKEY) so it is accurate even if modifiers were pressed
+    // or released while in passthrough mode.
+    if (pending_mode != MODE_NO_CHANGE) {
+      bool force_apply = false;
+
+      if (mod_state == 0 && array_qwerty_counter == 0) {
+        // Path 1: safe to apply now.
+        force_apply = true;
+      } else if (!pending_mode_has_deadline) {
+        // Path 2: first deferral — start the clock.
+        clock_gettime(CLOCK_MONOTONIC, &pending_mode_deadline);
+        pending_mode_deadline.tv_sec += PENDING_MODE_TIMEOUT_SEC;
+        pending_mode_has_deadline = true;
+        log_msg(stderr,
+                "Signal: mode change deferred (mod_state=0x%x, "
+                "qwerty_counter=%d), deadline in %ds\n",
+                mod_state, array_qwerty_counter, PENDING_MODE_TIMEOUT_SEC);
+      } else {
+        // Path 3: deadline already set — check expiry.
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec > pending_mode_deadline.tv_sec ||
+            (now.tv_sec == pending_mode_deadline.tv_sec &&
+             now.tv_nsec >= pending_mode_deadline.tv_nsec)) {
+          log_msg(stderr,
+                  "Signal: deadline expired, force-applying "
+                  "(mod_state=0x%x, qwerty_counter=%d)\n",
+                  mod_state, array_qwerty_counter);
+          release_all_keys(fdo);
+          mod_state = 0;
+          array_qwerty_counter = 0;
+          memset(array_qwerty, 0, sizeof(array_qwerty));
+          force_apply = true;
+        }
       }
-      pending_mode = MODE_NO_CHANGE;
+
+      if (force_apply) {
+        if (pending_mode == MODE_ON) {
+          disable_mapping = false;
+          signal_controlled = true;
+          l_alt = 0;
+          log_msg(stderr, "Signal: Dvorak mapping enabled (on)\n");
+        } else if (pending_mode == MODE_OFF) {
+          disable_mapping = true;
+          signal_controlled = true;
+          l_alt = 0;
+          log_msg(stderr, "Signal: passthrough mode (off)\n");
+        }
+        pending_mode = MODE_NO_CHANGE;
+        pending_mode_has_deadline = false;
+
+        // CHANGE: Sync mod_state from physical key state so it is
+        // correct regardless of what happened during passthrough.
+        sync_mod_state_from_hardware(fdi, &mod_state, noCapsLockAsModifier);
+      }
     }
+    // ── End pending mode change processing ───────────────────────────
+
+    // ── CHANGE: Bounded wait when a deadline is active ───────────────
+    // Without this, read() blocks indefinitely and the deadline check
+    // at the top of the loop never fires if no key events arrive (e.g.
+    // the user walked away from the keyboard while mod_state is stuck).
+    // poll() returns after at most ms_remaining milliseconds, at which
+    // point we loop back to the deadline check.
+    if (pending_mode != MODE_NO_CHANGE && pending_mode_has_deadline) {
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      long ms_remaining =
+          (pending_mode_deadline.tv_sec - now.tv_sec) * 1000 +
+          (pending_mode_deadline.tv_nsec - now.tv_nsec) / 1000000;
+      if (ms_remaining < 0)
+        ms_remaining = 0;
+
+      struct pollfd pfd = {.fd = fdi, .events = POLLIN};
+      int pret = poll(&pfd, 1, (int)ms_remaining);
+      if (pret == 0) {
+        // Timeout — no events before deadline.  Loop back so
+        // Path 3 above will force-apply.
+        continue;
+      }
+      if (pret < 0) {
+        if (errno == EINTR)
+          continue; // signal arrived — check pending_mode
+        log_msg(stderr, "poll error on [%s]: %s\n", device, strerror(errno));
+        exit_code = EXIT_DEVICE_GONE;
+        break;
+      }
+      // pret > 0: data ready, fall through to read()
+      if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+        log_msg(stderr, "poll: device error on [%s] (revents=0x%x)\n", device,
+                (unsigned)pfd.revents);
+        exit_code = EXIT_DEVICE_GONE;
+        break;
+      }
+    }
+    // ── End bounded wait ─────────────────────────────────────────────
 
     ssize_t n = read(fdi, &ev, sizeof ev);
     if (n == (ssize_t)-1) {

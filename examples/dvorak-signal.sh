@@ -30,7 +30,6 @@ log() { "$QUIET" && return 0; echo "$@"; }
 log_err() { "$QUIET" && return 0; echo "$@" >&2; }
 # ─────────────────────────────────────────────────────────────────────
 
-# usage() always prints — bad invocation needs visible feedback.
 usage() {
     echo "Usage: $0 [--quiet] {on|off}" >&2
     echo "  on     — enable Dvorak mapping (SIGUSR1)" >&2
@@ -69,13 +68,23 @@ fi
 sent=0
 failed=0
 
-# Try PID files first
+# CHANGE: Track stale PID files so we can clean them up after the loop.
+stale_pidfiles=()
+
 for pidfile in "${PIDFILE_DIR}"/${PIDFILE_GLOB}; do
     pid=$(cat "$pidfile" 2>/dev/null) || continue
-    [[ "$pid" =~ ^[0-9]+$ ]] || { log_err "Warning: corrupt PID file ${pidfile}"; failed=$((failed + 1)); continue; }
+    if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+        log_err "Warning: corrupt PID file ${pidfile}"
+        # CHANGE: Remove corrupt PID files instead of just warning.
+        stale_pidfiles+=("$pidfile")
+        failed=$((failed + 1))
+        continue
+    fi
 
     if ! kill -0 "$pid" 2>/dev/null; then
         log_err "Warning: stale PID file ${pidfile} (pid=${pid})"
+        # CHANGE: Collect for cleanup.
+        stale_pidfiles+=("$pidfile")
         failed=$((failed + 1))
         continue
     fi
@@ -83,17 +92,34 @@ for pidfile in "${PIDFILE_DIR}"/${PIDFILE_GLOB}; do
     proc_name=$(cat "/proc/$pid/comm" 2>/dev/null) || true
     if [[ "$proc_name" != "$PROCESS_NAME" ]]; then
         log_err "Warning: PID ${pid} from ${pidfile} is not dvorak (is: ${proc_name:-unknown})"
+        # CHANGE: Collect for cleanup — the PID was reused by another process.
+        stale_pidfiles+=("$pidfile")
         failed=$((failed + 1))
         continue
     fi
 
+    # CHANGE: Retry the kill once on transient failure (e.g. signal queue full,
+    # brief scheduling delay).
     if kill -s "$SIG" "$pid" 2>/dev/null; then
         log "Sent SIG${SIG} to PID ${pid} (from ${pidfile})"
         sent=$((sent + 1))
     else
-        log_err "Warning: failed to signal PID ${pid} (from ${pidfile})"
-        failed=$((failed + 1))
+        sleep 0.05
+        if kill -s "$SIG" "$pid" 2>/dev/null; then
+            log "Sent SIG${SIG} to PID ${pid} (from ${pidfile}, retry)"
+            sent=$((sent + 1))
+        else
+            log_err "Warning: failed to signal PID ${pid} (from ${pidfile})"
+            failed=$((failed + 1))
+        fi
     fi
+done
+
+# CHANGE: Clean up stale/corrupt PID files so they don't cause repeated
+# warnings and slow down future invocations.
+for sf in "${stale_pidfiles[@]+"${stale_pidfiles[@]}"}"; do
+    rm -f "$sf" 2>/dev/null
+    log "Cleaned up stale PID file: ${sf}"
 done
 
 # Fall back to pkill if no valid PID files were found
@@ -106,7 +132,6 @@ if [[ $sent -eq 0 ]]; then
     fi
 fi
 
-# Partial success = non-zero exit so callers can detect
 if [[ $failed -gt 0 ]]; then
     log_err "Warning: ${failed} pidfile(s) had issues (${sent} signaled successfully)"
     exit 2

@@ -88,7 +88,10 @@ SUBSCRIBE_FIFO="/tmp/${SCRIPT_NAME}.$$.fifo"
 LOG_FILE="/tmp/dvorak-layout.log"
 MAX_LOG_BYTES=1048576  # 1 MiB
 
-# FIX: Rotate log so /tmp (often tmpfs) doesn't fill up.
+# CHANGE: Max consecutive read-timeouts before we tear down the subscription
+# and reconnect.  At 5 s per timeout this is ~5 minutes.
+MAX_CONSECUTIVE_TIMEOUTS=60
+
 rotate_log() {
     local size
     size=$(stat -c%s "$LOG_FILE" 2>/dev/null) || return
@@ -97,8 +100,6 @@ rotate_log() {
     fi
 }
 
-# FIX: Exclude the Virtual Dvorak Keyboard created by dvorak.c so we
-#      always read the layout index of a real physical keyboard.
 get_layout_index() {
     local result
     result=$(swaymsg -t get_inputs 2>/dev/null | jq -r '
@@ -113,12 +114,6 @@ get_layout_index() {
     fi
 }
 
-# FIX: Only update LAST_INDEX on success. Clear on failure to force retry.
-# FIX: Capture $? before $(date) clobbers it.
-# FIX (this round): Do NOT pass --quiet to signal script — just redirect
-#      output to /dev/null.  This keeps the watcher compatible with any
-#      version of dvorak-signal.sh, and the redirect already suppresses
-#      all output.
 signal_for_index() {
     local index="$1"
     [[ -z "$index" ]] && return
@@ -168,7 +163,9 @@ while true; do
 
     exec 3<> "$SUBSCRIBE_FIFO"
 
-    swaymsg -t subscribe -m '["input"]' > "$SUBSCRIBE_FIFO" 2>/dev/null 3<&- &
+    # CHANGE: stdbuf -oL forces line-buffered stdout so events aren't
+    # trapped in glibc's full-size buffer when writing to a FIFO.
+    stdbuf -oL swaymsg -t subscribe -m '["input"]' > "$SUBSCRIBE_FIFO" 2>/dev/null 3<&- &
     SWAYMSG_PID=$!
 
     sleep 0.2
@@ -181,10 +178,34 @@ while true; do
         continue
     fi
 
+    # CHANGE: Track consecutive timeouts for staleness detection.
+    consecutive_timeouts=0
+
     while is_alive "$SWAYMSG_PID"; do
         if read -r -t 5 _event <&3 2>/dev/null; then
+            # CHANGE: Reset staleness counter on any successful read.
+            consecutive_timeouts=0
             index=$(get_layout_index)
             signal_for_index "$index"
+        else
+            # CHANGE [PRIMARY FIX]: The timeout path now polls the layout
+            # as a fallback.  Previously this was a no-op — if the event
+            # stream stalled (sway reload, suspend/resume, buffering),
+            # layout changes were never noticed and the toggle "hung".
+            index=$(get_layout_index)
+            signal_for_index "$index"
+
+            # CHANGE: If we haven't received a single event in
+            # MAX_CONSECUTIVE_TIMEOUTS cycles, assume the IPC
+            # subscription is stale and force a reconnect.
+            consecutive_timeouts=$((consecutive_timeouts + 1))
+            if [[ $consecutive_timeouts -ge $MAX_CONSECUTIVE_TIMEOUTS ]]; then
+                log "Stale subscription detected (${consecutive_timeouts} consecutive timeouts), restarting..."
+                kill "$SWAYMSG_PID" 2>/dev/null
+                sleep 0.1
+                kill -9 "$SWAYMSG_PID" 2>/dev/null
+                break
+            fi
         fi
     done
 
